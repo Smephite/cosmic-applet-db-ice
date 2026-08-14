@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=ICE Speed
+Comment=Show current ICE train speed in the panel
+Type=Application
+Exec=cosmic-applet-db-ice
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;ICE;Train;Speed;
+Icon=media-playlist-shuffle-symbolic
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
