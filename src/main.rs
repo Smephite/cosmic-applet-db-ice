@@ -115,16 +115,67 @@ impl SpeedGraph {
             .iter()
             .map(|s| s.1)
             .fold(0.0f64, f64::max)
-            .max(10.0)
+            .max(50.0)
+    }
+
+    /// Rounds max speed up to the next multiple of 50 for clean grid lines.
+    fn grid_max(&self) -> f64 {
+        let max = self.max_speed();
+        (max / 50.0).ceil() * 50.0
+    }
+
+    /// Finds the sample closest to a given x position within the graph bounds.
+    fn sample_at_x(&self, x_frac: f32) -> Option<(f64, Duration)> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let window = SPEED_HISTORY_DURATION.as_secs_f64();
+        let target_age = (1.0 - x_frac as f64) * window;
+
+        self.samples
+            .iter()
+            .min_by_key(|(t, _)| {
+                let age = now.duration_since(*t).as_millis() as i64;
+                (age - (target_age * 1000.0) as i64).unsigned_abs()
+            })
+            .map(|(t, speed)| (*speed, now.duration_since(*t)))
     }
 }
 
+#[derive(Default)]
+struct GraphState {
+    hover_x: Option<f32>,
+}
+
 impl<Message> canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for SpeedGraph {
-    type State = ();
+    type State = GraphState;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: &iced::Event,
+        bounds: iced::Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<Message>> {
+        match event {
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                state.hover_x = cursor
+                    .position_in(bounds)
+                    .map(|pos| (pos.x / bounds.width).clamp(0.0, 1.0));
+                Some(canvas::Action::request_redraw())
+            }
+            iced::Event::Mouse(mouse::Event::CursorLeft) => {
+                state.hover_x = None;
+                Some(canvas::Action::request_redraw())
+            }
+            _ => None,
+        }
+    }
 
     fn draw(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         renderer: &cosmic::Renderer,
         _theme: &cosmic::Theme,
         bounds: iced::Rectangle,
@@ -137,42 +188,98 @@ impl<Message> canvas::Program<Message, cosmic::Theme, cosmic::Renderer> for Spee
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let w = bounds.width;
         let h = bounds.height;
-        let max_speed = self.max_speed();
+        let grid_max = self.grid_max() as f32;
         let now = Instant::now();
-        let window = SPEED_HISTORY_DURATION.as_secs_f64();
+        let window = SPEED_HISTORY_DURATION.as_secs_f64() as f32;
 
-        let grid_color = Color::from_rgba(1.0, 1.0, 1.0, 0.1);
-        for i in 1..4 {
-            let y = h * (i as f32) / 4.0;
+        // Grid lines at every 50 km/h
+        let minor_color = Color::from_rgba(1.0, 1.0, 1.0, 0.07);
+        let major_color = Color::from_rgba(1.0, 1.0, 1.0, 0.2);
+        let label_color = Color::from_rgba(1.0, 1.0, 1.0, 0.4);
+        let steps = (grid_max / 50.0) as u32;
+        for i in 1..=steps {
+            let speed_val = i as f32 * 50.0;
+            let y = h * (1.0 - speed_val / grid_max);
+            if y < 0.0 {
+                break;
+            }
+            let is_major = speed_val % 100.0 == 0.0;
             let mut line = canvas::path::Builder::new();
             line.move_to(Point::new(0.0, y));
             line.line_to(Point::new(w, y));
             frame.stroke(
                 &line.build(),
                 canvas::Stroke::default()
-                    .with_color(grid_color)
-                    .with_width(1.0),
+                    .with_color(if is_major { major_color } else { minor_color })
+                    .with_width(if is_major { 1.0 } else { 0.5 }),
             );
+            if is_major {
+                frame.fill_text(canvas::Text {
+                    content: format!("{}", speed_val as u32),
+                    position: Point::new(2.0, y - 12.0),
+                    color: label_color,
+                    size: 10.0.into(),
+                    ..canvas::Text::default()
+                });
+            }
         }
 
+        // Speed line
         let mut path = canvas::path::Builder::new();
         for (i, (t, speed)) in self.samples.iter().enumerate() {
-            let age = now.duration_since(*t).as_secs_f64();
-            let x = w * (1.0 - age as f32 / window as f32);
-            let y = h * (1.0 - *speed as f32 / max_speed as f32);
+            let age = now.duration_since(*t).as_secs_f32();
+            let x = w * (1.0 - age / window);
+            let y = h * (1.0 - *speed as f32 / grid_max);
             if i == 0 {
                 path.move_to(Point::new(x, y));
             } else {
                 path.line_to(Point::new(x, y));
             }
         }
-
         frame.stroke(
             &path.build(),
             canvas::Stroke::default()
                 .with_color(Color::from_rgba(0.4, 0.7, 1.0, 0.9))
                 .with_width(2.0),
         );
+
+        // Hover crosshair + tooltip
+        if let Some(x_frac) = state.hover_x {
+            if let Some((speed, age)) = self.sample_at_x(x_frac) {
+                let x = x_frac * w;
+                let y = h * (1.0 - speed as f32 / grid_max);
+
+                // Vertical line
+                let mut vline = canvas::path::Builder::new();
+                vline.move_to(Point::new(x, 0.0));
+                vline.line_to(Point::new(x, h));
+                frame.stroke(
+                    &vline.build(),
+                    canvas::Stroke::default()
+                        .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.3))
+                        .with_width(1.0),
+                );
+
+                // Dot
+                frame.fill(
+                    &canvas::Path::circle(Point::new(x, y), 3.0),
+                    Color::from_rgba(0.4, 0.7, 1.0, 1.0),
+                );
+
+                // Label
+                let mins_ago = age.as_secs() / 60;
+                let secs_ago = age.as_secs() % 60;
+                let label = format!("{} km/h (-{}:{:02})", speed as u32, mins_ago, secs_ago);
+                let text_x = if x_frac > 0.6 { x - 120.0 } else { x + 6.0 };
+                frame.fill_text(canvas::Text {
+                    content: label,
+                    position: Point::new(text_x, y.clamp(2.0, h - 14.0)),
+                    color: Color::WHITE,
+                    size: 11.0.into(),
+                    ..canvas::Text::default()
+                });
+            }
+        }
 
         vec![frame.into_geometry()]
     }
@@ -461,9 +568,8 @@ impl cosmic::Application for IceApplet {
         }
 
         if self.speed_graph.samples.len() >= 2 {
-            let max = self.speed_graph.max_speed() as u32;
             items.push(divider::horizontal::default().into());
-            items.push(text::body(format!("Speed (15 min, max {max} km/h)")).into());
+            items.push(text::body("Speed (last 15 min)").into());
             items.push(
                 canvas::Canvas::new(&self.speed_graph)
                     .width(Length::Fill)
